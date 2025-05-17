@@ -1,9 +1,9 @@
 import { Router, Request, Response } from 'express';
 import { body } from 'express-validator';
-import { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { authenticateToken } from '../middleware/auth.middleware';
+const db = require('../config');
 
 // Extend Express Request type to include user
 interface AuthenticatedRequest extends Request {
@@ -14,7 +14,6 @@ interface AuthenticatedRequest extends Request {
 }
 
 const router = Router();
-const prisma = new PrismaClient();
 
 // Validation middleware
 const registerValidation = [
@@ -22,9 +21,8 @@ const registerValidation = [
   body('password')
     .isLength({ min: 6 })
     .withMessage('Password must be at least 6 characters long'),
-  body('firstName').notEmpty().withMessage('First name is required'),
-  body('lastName').notEmpty().withMessage('Last name is required'),
-  body('role').isIn(['ADMIN', 'LECTURER', 'STUDENT']).withMessage('Invalid role'),
+  body('name').notEmpty().withMessage('Name is required'),
+  body('roleID').isInt().withMessage('Valid role ID is required'),
 ];
 
 const loginValidation = [
@@ -35,14 +33,12 @@ const loginValidation = [
 // Register new user
 router.post('/register', registerValidation, async (req: Request, res: Response) => {
   try {
-    const { email, password, firstName, lastName, role } = req.body;
+    const { email, password, name, roleID } = req.body;
 
     // Check if user already exists
-    const existingUser = await prisma.user.findUnique({
-      where: { email },
-    });
+    const [existingUsers] = await db.query('SELECT * FROM user WHERE email = ?', [email]);
 
-    if (existingUser) {
+    if (existingUsers.length > 0) {
       return res.status(400).json({ message: 'User already exists' });
     }
 
@@ -50,19 +46,21 @@ router.post('/register', registerValidation, async (req: Request, res: Response)
     const hashedPassword = await bcrypt.hash(password, 10);
 
     // Create user
-    const user = await prisma.user.create({
-      data: {
-        email,
-        password: hashedPassword,
-        firstName,
-        lastName,
-        role,
-      },
-    });
+    const [result] = await db.query(
+      'INSERT INTO user (name, email, password, roleID) VALUES (?, ?, ?, ?)',
+      [name, email, hashedPassword, roleID]
+    );
+
+    const [newUser] = await db.query(`
+      SELECT u.*, r.name as roleName 
+      FROM user u 
+      JOIN role r ON u.roleID = r.roleID 
+      WHERE u.userID = ?
+    `, [result.insertId]);
 
     // Generate JWT
     const token = jwt.sign(
-      { userId: user.id, role: user.role },
+      { userId: newUser[0].userID, role: newUser[0].roleName },
       process.env.JWT_SECRET || 'your-secret-key',
       { expiresIn: '24h' }
     );
@@ -71,11 +69,11 @@ router.post('/register', registerValidation, async (req: Request, res: Response)
       message: 'User registered successfully',
       token,
       user: {
-        id: user.id,
-        email: user.email,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        role: user.role,
+        userID: newUser[0].userID,
+        name: newUser[0].name,
+        email: newUser[0].email,
+        roleID: newUser[0].roleID,
+        roleName: newUser[0].roleName,
       },
     });
   } catch (error) {
@@ -89,13 +87,18 @@ router.post('/login', loginValidation, async (req: Request, res: Response) => {
     const { email, password } = req.body;
 
     // Find user
-    const user = await prisma.user.findUnique({
-      where: { email },
-    });
+    const [users] = await db.query(`
+      SELECT u.*, r.name as roleName 
+      FROM user u 
+      JOIN role r ON u.roleID = r.roleID 
+      WHERE u.email = ?
+    `, [email]);
 
-    if (!user) {
+    if (users.length === 0) {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
+
+    const user = users[0];
 
     // Check password
     const validPassword = await bcrypt.compare(password, user.password);
@@ -106,7 +109,7 @@ router.post('/login', loginValidation, async (req: Request, res: Response) => {
 
     // Generate JWT
     const token = jwt.sign(
-      { userId: user.id, role: user.role },
+      { userId: user.userID, role: user.roleName },
       process.env.JWT_SECRET || 'your-secret-key',
       { expiresIn: '24h' }
     );
@@ -115,11 +118,11 @@ router.post('/login', loginValidation, async (req: Request, res: Response) => {
       message: 'Login successful',
       token,
       user: {
-        id: user.id,
+        userID: user.userID,
+        name: user.name,
         email: user.email,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        role: user.role,
+        roleID: user.roleID,
+        roleName: user.roleName,
       },
     });
   } catch (error) {
@@ -134,23 +137,18 @@ router.get('/profile', authenticateToken, async (req: AuthenticatedRequest, res:
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const user = await prisma.user.findUnique({
-      where: { id: req.user.userId },
-      select: {
-        id: true,
-        email: true,
-        firstName: true,
-        lastName: true,
-        role: true,
-        createdAt: true,
-      },
-    });
+    const [users] = await db.query(`
+      SELECT u.*, r.name as roleName 
+      FROM user u 
+      JOIN role r ON u.roleID = r.roleID 
+      WHERE u.userID = ?
+    `, [req.user.userId]);
 
-    if (!user) {
+    if (users.length === 0) {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    return res.json(user);
+    return res.json(users[0]);
   } catch (error) {
     return res.status(500).json({ message: 'Error fetching profile' });
   }
@@ -163,29 +161,36 @@ router.put('/profile', authenticateToken, async (req: AuthenticatedRequest, res:
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { firstName, lastName } = req.body;
+    const { name } = req.body;
 
-    const user = await prisma.user.update({
-      where: { id: req.user.userId },
-      data: {
-        firstName,
-        lastName,
-      },
-      select: {
-        id: true,
-        email: true,
-        firstName: true,
-        lastName: true,
-        role: true,
-      },
-    });
+    await db.query(
+      'UPDATE user SET name = ? WHERE userID = ?',
+      [name, req.user.userId]
+    );
+
+    const [updatedUser] = await db.query(`
+      SELECT u.*, r.name as roleName 
+      FROM user u 
+      JOIN role r ON u.roleID = r.roleID 
+      WHERE u.userID = ?
+    `, [req.user.userId]);
 
     return res.json({
       message: 'Profile updated successfully',
-      user,
+      user: updatedUser[0],
     });
   } catch (error) {
     return res.status(500).json({ message: 'Error updating profile' });
+  }
+});
+
+// Get all roles
+router.get('/roles', async (_req: Request, res: Response) => {
+  try {
+    const [roles] = await db.query('SELECT * FROM role');
+    return res.json(roles);
+  } catch (error) {
+    return res.status(500).json({ message: 'Error fetching roles' });
   }
 });
 
